@@ -409,24 +409,112 @@ async function getMarketRegime() {
 }
 
 // ════════════════════════════════════════
-// 評分引擎
+// 優雅降級架構（Graceful Degradation）
 // ════════════════════════════════════════
-function calcScore(price,inst) {
+
+// 各模式評分天花板與正規化門檻
+const MODE_CONFIG = {
+  A:      { ceiling:100, threshold:85 },
+  B_PLUS: { ceiling:75,  threshold:64 },
+  B:      { ceiling:75,  threshold:64 },
+  C:      { ceiling:50,  threshold:43 },
+};
+
+// 部位上限
+const POSITION_CAP = {
+  A_HUNT:       "70%",
+  B_TRACK:      "25%",
+  B_PROXY_TRACK:"15%",
+  C_SCOUT:       "5%",
+  C_OBSERVE:     "0%",
+};
+
+// Freshness Factor 衰退表
+function freshnessF(days) {
+  const t={0:1.0,1:0.95,2:0.85,3:0.72,4:0.57,5:0.40,6:0.22};
+  return t[Math.min(days,6)]??0.0;
+}
+
+// 判斷資料模式
+function detectMode(inst) {
+  if (!inst || (!inst.sitDays && !inst.foreignDays && !inst.recent5Sit?.length))
+    return "C";
+  // 前端目前只能拿到月彙總（T86），對應 B 模式
+  return "B";
+}
+
+// 分數正規化
+function normalizeScore(raw, mode) {
+  const ceiling = MODE_CONFIG[mode]?.ceiling ?? 100;
+  return Math.min((raw / ceiling) * 100, 100);
+}
+
+// 評分引擎（含模式天花板）
+function calcScore(price, inst) {
   if (!price) return null;
-  const rs=price.changePct||0;
-  const rsScore=rs>=3&&price.above20ma?25:rs>=1?18:rs>=0?10:0;
-  const {sitDays=0,foreignDays=0,sitBuy=false}=inst||{};
-  const instScore=sitDays>=3?15:foreignDays>=3&&!sitBuy?8:sitDays*1.5+foreignDays*0.5>=3?10:sitDays*1.5+foreignDays*0.5>=1?5:0;
-  const vr=price.vol5avg&&price.vol20avg?price.vol5avg/price.vol20avg:1;
-  const healthScore=vr<=0.7?20:vr<=0.85?12:6;
-  const chipsScore=sitDays>=3?22:sitDays>=2?18:foreignDays>=3?14:8;
-  const total=Math.min(rsScore+chipsScore+instScore+healthScore+15,100);
-  let label,color,msg;
-  if(total>=85){label="等待Trigger";color="var(--green)";msg="深海章魚正在低調完成最後收集，浮額大量消失。此股正站在射程臨界點，請保持獵人耐心，設好條件單，等待觸發。";}
-  else if(total>=75){label="籌碼沉澱中";color="var(--blue)";msg=sitDays>=2?"深海章魚正在低調收集，市場尚未察覺。請保持獵人耐心，切勿提早追價。":"主力足跡清晰，籌碼結構健康。等待量縮完成後的突破訊號。";}
-  else if(total>=60){label="疑似吸籌";color="var(--amber)";msg="有潛在主力跡象，但結構尚未成熟。列入觀察名單持續追蹤。";}
-  else{label="冷眼旁觀";color="var(--txt-mut)";msg="結構條件未達標準，主力足跡模糊。此時進場為盲目行動。";}
-  return {total,label,color,msg,scores:{rsScore,chipsScore,instScore,healthScore,liquidScore:15},volRatio:vr.toFixed(2)};
+
+  const mode = detectMode(inst);
+  const rs   = price.changePct || 0;
+  const above = price.above20ma || false;
+  const vr   = (price.vol5avg && price.vol20avg)
+               ? price.vol5avg / price.vol20avg : 1;
+
+  const {sitDays=0, foreignDays=0, sitBuy=false} = inst || {};
+
+  // 各維度原始分
+  const rsScore = rs>=3&&above?25: rs>=1?18: rs>=0?10: 0;
+  const instScore = sitDays>=3?15: foreignDays>=3&&!sitBuy?8:
+    sitDays*1.5+foreignDays*0.5>=3?10: sitDays*1.5+foreignDays*0.5>=1?5: 0;
+  const healthScore = vr<=0.7?20: vr<=0.85?12: 6;
+
+  // B/C 模式：籌碼維度保守處理
+  let chipsScore;
+  if (mode==="A")      chipsScore = sitDays>=3?22: sitDays>=2?18: foreignDays>=3?14: 8;
+  else if (mode==="C") chipsScore = 0;
+  else                 chipsScore = sitDays>=1?10: foreignDays>=1?6: 3; // B模式保守
+
+  const raw   = Math.min(rsScore+chipsScore+instScore+healthScore+15, 100);
+  const norm  = normalizeScore(raw, mode);
+  const thr   = MODE_CONFIG[mode]?.threshold ?? 85;
+
+  // 決策模式
+  let dm, maxPos;
+  if (mode==="A") { dm="A_HUNT"; maxPos=POSITION_CAP.A_HUNT; }
+  else if (mode==="B_PLUS") { dm="B_TRACK"; maxPos=POSITION_CAP.B_TRACK; }
+  else if (mode==="B") { dm="B_PROXY_TRACK"; maxPos=POSITION_CAP.B_PROXY_TRACK; }
+  else if (norm>=85&&above) { dm="C_SCOUT"; maxPos=POSITION_CAP.C_SCOUT; }
+  else { dm="C_OBSERVE"; maxPos=POSITION_CAP.C_OBSERVE; }
+
+  // 訊號判斷
+  const signal = norm >= thr && dm !== "C_OBSERVE";
+
+  // 語意翻譯（依正規化分數）
+  let label, color, msg;
+  if (!signal || dm==="C_OBSERVE") {
+    label="冷眼旁觀"; color="var(--txt-mut)";
+    msg="結構條件未達標準或資料解析度不足。此時進場為盲目行動。";
+  } else if (norm>=85) {
+    label=dm==="C_SCOUT"?"有限防衛試單":"等待Trigger";
+    color="var(--green)";
+    msg=dm==="C_SCOUT"
+      ?"濃霧中偵測到強勢結構，允許 5% 試單，停損收緊 30%，嚴禁加碼。"
+      :"深海章魚正在低調完成最後收集，浮額大量消失。請保持獵人耐心，等待觸發。";
+  } else if (norm>=75) {
+    label="籌碼沉澱中"; color="var(--blue)";
+    msg=sitDays>=2?"深海章魚正在低調收集，市場尚未察覺。請保持獵人耐心，切勿提早追價。"
+      :"主力足跡清晰，籌碼結構健康。等待量縮完成後的突破訊號。";
+  } else {
+    label="疑似吸籌"; color="var(--amber)";
+    msg="有潛在主力跡象，但結構尚未成熟。列入觀察名單持續追蹤。";
+  }
+
+  return {
+    total: Math.round(norm), raw,
+    label, color, msg,
+    mode, dm, maxPos,
+    scores:{rsScore,chipsScore,instScore,healthScore,liquidScore:15},
+    volRatio: vr.toFixed(2),
+  };
 }
 
 // ════════════════════════════════════════
@@ -492,6 +580,18 @@ function cardHTML(d) {
   const {stockId,name,price:p,inst,score:s}=d;
   const isExp=expandedId===stockId;
   const pc=(p.changePct||0)>=0?"var(--up)":"var(--down)";
+
+  // 決策模式顯示設定
+  const modeColors={
+    A_HUNT:"var(--green)", B_TRACK:"var(--blue)",
+    B_PROXY_TRACK:"var(--blue)", C_SCOUT:"var(--amber)", C_OBSERVE:"var(--txt-mut)"
+  };
+  const modeColor = modeColors[s.dm]||"var(--txt-mut)";
+  const modeLabel = {
+    A_HUNT:"A 狩獵模式", B_TRACK:"B 跟蹤模式",
+    B_PROXY_TRACK:"B 代理模式", C_SCOUT:"C 試單模式", C_OBSERVE:"C 空倉觀望"
+  }[s.dm]||s.dm;
+
   let expanded="";
   if (isExp) {
     const vr=parseFloat(s.volRatio);
@@ -501,6 +601,19 @@ function cardHTML(d) {
         <div class="sec-title" style="color:${s.color}">◈ 系統語意翻譯</div>
         <div class="translation-text" style="border-left-color:${s.color}">「${s.msg}」</div>
       </div>
+
+      <div class="data-section">
+        <div class="sec-title" style="color:var(--txt-mut)">◈ 優雅降級狀態</div>
+        <div class="metrics-grid">
+          <div class="metric-cell"><div class="metric-label">資料模式</div>
+            <div class="metric-value" style="color:${modeColor};font-size:12px">${modeLabel}</div></div>
+          <div class="metric-cell"><div class="metric-label">正規化分數</div>
+            <div class="metric-value" style="color:${s.color}">${s.total}分</div></div>
+          <div class="metric-cell"><div class="metric-label">部位上限</div>
+            <div class="metric-value" style="color:${modeColor}">${s.maxPos}</div></div>
+        </div>
+      </div>
+
       <div class="data-section">
         <div class="sec-title" style="color:var(--txt-mut)">◈ 真實數據（TWSE 即時）</div>
         <div class="metrics-grid">
@@ -520,7 +633,11 @@ function cardHTML(d) {
         </div>
         ${trendHTML?`<div style="font-size:11px;color:var(--txt-mut);margin-bottom:5px">近5日投信買賣超（千張）</div><div class="trend-bars">${trendHTML}</div>`:""}
       </div>
-      <div class="warn-box">⚠️ <b>注意：</b>「籌碼動向」分數目前以法人動向替代券商分點計算。串接付費分點 API 後此分數將更精確。</div>
+      <div class="warn-box">
+        ⚠️ 目前運行於 <b>${s.mode} 模式</b>，籌碼動向以法人月彙總代替分點資料計算。
+        ${s.dm==="C_SCOUT"?"<br>🔴 <b>C_SCOUT 有限防衛：最多 5% 試單，停損收緊 30%，禁止加碼。</b>":""}
+        串接付費分點 API 可升級至 A 模式，解鎖完整狩獵功能。
+      </div>
     </div>`;
   }
   return `<div class="card" id="card-${stockId}" style="border-left-color:${s.color};border-color:${s.color}44" onclick="toggleCard('${stockId}')">
@@ -531,11 +648,13 @@ function cardHTML(d) {
           <span class="stock-name">${name}</span>
           <span class="stock-id">${stockId}</span>
           <span class="chip" style="color:${s.color};background:${s.color}1a;border:1px solid ${s.color}55">${s.label}</span>
+          <span class="chip" style="color:${modeColor};background:${modeColor}12;border:1px solid ${modeColor}33;font-size:10px">${modeLabel}</span>
         </div>
         <div class="card-price-row">
           <span class="stock-price" style="color:${pc}">${(p.price||0).toLocaleString()}</span>
           <span class="stock-change" style="color:${pc}">${(p.changePct||0)>=0?"▲":"▼"}${Math.abs(p.changePct||0).toFixed(2)}%</span>
           <span class="stock-date">${p.dataDate||""}</span>
+          <span style="font-size:11px;color:var(--txt-mut)">部位上限 <b style="color:${modeColor}">${s.maxPos}</b></span>
         </div>
       </div>
       <span class="card-toggle">${isExp?"▲":"▼"}</span>
