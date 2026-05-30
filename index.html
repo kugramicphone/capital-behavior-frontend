@@ -237,6 +237,11 @@
         <div class="wl-title">觀察名單管理</div>
         <div class="wl-count" id="wl-count"></div>
       </div>
+      <button onclick="resetWatchlist()" style="padding:6px 14px;border-radius:8px;
+        border:1px solid var(--border);background:var(--bg-section);
+        color:var(--txt-mut);cursor:pointer;font-size:12px;font-family:inherit;">
+        ↺ 重設為預設值
+      </button>
     </div>
     <div class="wl-search-wrap">
       <input class="wl-search" id="wl-search" type="text"
@@ -344,36 +349,69 @@ function getStockName(id) {
 }
 
 // ══════════════════════════════════════════════════════
-// 觀察名單
+// 觀察名單持久化（localStorage）
+// ══════════════════════════════════════════════════════
+const LS_WATCHLIST = "cbv2_watchlist";   // 儲存自訂觀察名單
+const LS_BATTLEFIELD = "cbv2_battlefield"; // 儲存上次選的作戰群組
+
+function saveWatchlist() {
+  try {
+    localStorage.setItem(LS_WATCHLIST, JSON.stringify(watchlist));
+  } catch(e) { /* 隱私模式或儲存滿時靜默忽略 */ }
+}
+
+function loadSavedWatchlist() {
+  try {
+    const raw = localStorage.getItem(LS_WATCHLIST);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch {}
+  return null; // 沒有儲存紀錄，回傳 null → 用預設值
+}
+
+function saveBattlefield(key) {
+  try { localStorage.setItem(LS_BATTLEFIELD, key); } catch {}
+}
+
+function loadSavedBattlefield() {
+  try { return localStorage.getItem(LS_BATTLEFIELD) || "core"; } catch { return "core"; }
+}
+
+// ══════════════════════════════════════════════════════
+// 觀察名單操作（含自動儲存）
 // ══════════════════════════════════════════════════════
 let watchlist = [...CORE_RADAR];
 
 function addToWatchlist(stock) {
   if (watchlist.find(w=>w.id===stock.id)) return;
-  if (watchlist.length >= 20) {alert("觀察名單最多 20 支");return;}
+  if (watchlist.length >= 20) { alert("觀察名單最多 20 支"); return; }
   watchlist.push(stock);
+  saveWatchlist();       // ← 每次新增立即存檔
   renderWatchlist();
-  document.getElementById("wl-search").value="";
+  document.getElementById("wl-search").value = "";
   hideDropdown();
 }
 
 function removeFromWatchlist(id) {
   watchlist = watchlist.filter(w=>w.id!==id);
+  saveWatchlist();       // ← 每次刪除立即存檔
   renderWatchlist();
 }
 
 function renderWatchlist() {
-  const list=document.getElementById("wl-list");
-  const empty=document.getElementById("wl-empty");
-  document.getElementById("wl-count").textContent=`共 ${watchlist.length} 支 / 最多 20 支`;
-  if (!watchlist.length) {list.innerHTML="";empty.style.display="block";return;}
-  empty.style.display="none";
-  list.innerHTML=watchlist.map((s,i)=>`
+  const list  = document.getElementById("wl-list");
+  const empty = document.getElementById("wl-empty");
+  document.getElementById("wl-count").textContent = `共 ${watchlist.length} 支 / 最多 20 支`;
+  if (!watchlist.length) { list.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display = "none";
+  list.innerHTML = watchlist.map((s,i) => `
     <div class="wl-item">
       <span class="wl-item-num">${i+1}</span>
       <span class="wl-item-id">${s.id}</span>
       <span class="wl-item-name">${s.name}</span>
-      ${s.role?`<span class="wl-item-role">${s.role}</span>`:""}
+      ${s.role ? `<span class="wl-item-role">${s.role}</span>` : ""}
       <button class="btn-del" onclick="removeFromWatchlist('${s.id}')">✕</button>
     </div>`).join("");
 }
@@ -398,6 +436,16 @@ function onSearchInput(val) {
 }
 
 function hideDropdown(){document.getElementById("wl-dropdown").classList.remove("show");}
+
+function resetWatchlist() {
+  if (!confirm("確定要重設為目前群組的預設名單嗎？")) return;
+  if (currentBF === "core") watchlist = [...CORE_RADAR];
+  else watchlist = [...BATTLEFIELDS[currentBF]];
+  // 補全名稱
+  watchlist = watchlist.map(s=>({...s, name: stockMap[s.id]?.name||s.name}));
+  saveWatchlist();
+  renderWatchlist();
+}
 
 // ══════════════════════════════════════════════════════
 // TWSE API
@@ -653,13 +701,15 @@ function calcMigrationFromCache(){
 // 作戰群組切換
 // ══════════════════════════════════════════════════════
 async function changeBattlefield(groupKey, btn){
-  currentBF=groupKey;
+  currentBF = groupKey;
+  saveBattlefield(groupKey);   // ← 記住上次選的群組
   ["core","risk_on","risk_off"].forEach(k=>{
-    const b=document.getElementById(`bf-${k}`);
-    if(b)b.className=`bf-pill${k===groupKey?` active-${k}`:""}`;
+    const b = document.getElementById(`bf-${k}`);
+    if(b) b.className = `bf-pill${k===groupKey ? ` active-${k}` : ""}`;
   });
-  if(groupKey==="core") watchlist=[...CORE_RADAR];
-  else watchlist=[...BATTLEFIELDS[groupKey]];
+  if(groupKey==="core") watchlist = [...CORE_RADAR];
+  else watchlist = [...BATTLEFIELDS[groupKey]];
+  saveWatchlist();             // ← 切換群組時同步存檔
   renderWatchlist();
   await runScan();
 }
@@ -822,13 +872,37 @@ function switchTab(tab,btn){
 // ══════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════
-document.addEventListener("DOMContentLoaded",async()=>{
+document.addEventListener("DOMContentLoaded", async () => {
   await loadStockList();
-  // 用對照表補全 CORE / BATTLEFIELDS 名稱
-  const enrichName=arr=>arr.map(s=>({...s,name:stockMap[s.id]?.name||s.name}));
-  CORE_RADAR.forEach((s,i)=>{if(stockMap[s.id])CORE_RADAR[i].name=stockMap[s.id].name;});
-  Object.keys(BATTLEFIELDS).forEach(k=>{BATTLEFIELDS[k]=enrichName(BATTLEFIELDS[k]);});
-  watchlist=enrichName(watchlist);
+
+  // 用 TWSE 對照表補全內建群組名稱
+  const enrichName = arr => arr.map(s => ({...s, name: stockMap[s.id]?.name || s.name}));
+  CORE_RADAR.forEach((s,i) => { if(stockMap[s.id]) CORE_RADAR[i].name = stockMap[s.id].name; });
+  Object.keys(BATTLEFIELDS).forEach(k => { BATTLEFIELDS[k] = enrichName(BATTLEFIELDS[k]); });
+
+  // 恢復上次選擇的作戰群組
+  const savedBF = loadSavedBattlefield();
+  currentBF = savedBF;
+  ["core","risk_on","risk_off"].forEach(k => {
+    const b = document.getElementById(`bf-${k}`);
+    if(b) b.className = `bf-pill${k===savedBF ? ` active-${k}` : ""}`;
+  });
+
+  // 恢復儲存的觀察名單
+  // 優先順序：localStorage 儲存 > 群組預設值
+  const saved = loadSavedWatchlist();
+  if (saved) {
+    // 補全名稱（用 stockMap 覆蓋，確保名稱是最新的）
+    watchlist = saved.map(s => ({
+      ...s,
+      name: stockMap[s.id]?.name || s.name || s.id,
+    }));
+  } else {
+    // 第一次開啟，用群組預設值
+    if (savedBF === "core") watchlist = [...CORE_RADAR];
+    else watchlist = enrichName([...BATTLEFIELDS[savedBF]]);
+  }
+
   renderWatchlist();
   runScan();
 });
