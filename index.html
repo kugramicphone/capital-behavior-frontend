@@ -485,15 +485,23 @@ function resetWatchlist() {
 }
 
 // ══════════════════════════════════════════════════════
-// TWSE API
+// TWSE + TPEx 雙軌 API
 // ══════════════════════════════════════════════════════
 const TWSE="https://www.twse.com.tw/rwd/zh";
+const TPEX="https://www.tpex.org.tw/openapi/v1";
 const _instCache={};
 
 function recentMonths(n){
   const r=[],d=new Date();
   for(let i=0;i<n;i++){r.push(`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}`);d.setMonth(d.getMonth()-1);}
   return r;
+}
+
+// 民國年日期（TPEx 格式：YYY/MM/DD）
+function toRocYM(yyyymm){
+  const y=parseInt(yyyymm.slice(0,4))-1911;
+  const m=yyyymm.slice(4,6);
+  return `${y}/${m}/01`;
 }
 
 async function twseFetch(url,params={}){
@@ -510,17 +518,91 @@ async function twseFetch(url,params={}){
   return null;
 }
 
+// TPEx openapi fetch（回傳 JSON 陣列）
+async function tpexFetch(endpoint,params={}){
+  const qs=new URLSearchParams(params).toString();
+  const url=`${TPEX}/${endpoint}${qs?"?"+qs:""}`;
+  for(let i=0;i<3;i++){
+    try{
+      if(i>0)await sleep(800*i);
+      const r=await fetch(url,{headers:{"Accept":"application/json"},mode:"cors"});
+      if(!r.ok)continue;
+      const d=await r.json();
+      if(Array.isArray(d)&&d.length>0)return d;
+    }catch{}
+  }
+  return null;
+}
+
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
+// 判斷股票屬於哪個市場
+function getMarket(stockId){
+  return stockMap[stockId]?.market || "TWSE"; // 預設上市
+}
+
+// ── 個股日K（自動依市場路由）
 async function getStockPrice(stockId){
+  const market=getMarket(stockId);
+  return market==="TPEx"
+    ? getTPExStockPrice(stockId)
+    : getTWSEStockPrice(stockId);
+}
+
+async function getTWSEStockPrice(stockId){
   const months=recentMonths(3),rows=[];
   for(const ym of months){
     const data=await twseFetch(`${TWSE}/afterTrading/STOCK_DAY`,{stockNo:stockId,date:ym+"01"});
     for(const row of(data?.data||[])){
-      try{const c=parseFloat(row[6].replace(/,/g,"")),v=Math.floor(parseInt(row[1].replace(/,/g,""))/1000);if(!isNaN(c)&&c>0)rows.push({date:row[0],close:c,volume:v});}catch{}
+      try{
+        const c=parseFloat(row[6].replace(/,/g,"")),v=Math.floor(parseInt(row[1].replace(/,/g,""))/1000);
+        if(!isNaN(c)&&c>0)rows.push({date:row[0],close:c,volume:v});
+      }catch{}
     }
     await sleep(400);
   }
+  return buildPriceResult(stockId, rows);
+}
+
+async function getTPExStockPrice(stockId){
+  const months=recentMonths(3),rows=[];
+  for(const ym of months){
+    // TPEx 個股月成交：tpex_stock_monthly_trading_info
+    const rocDate=toRocYM(ym);
+    const data=await tpexFetch("tpex_stock_monthly_trading_info",{l:"zh-tw",d:rocDate,s:stockId});
+    // 也試 tpex_mainboard_daily_close_quotes（全市場每日，用日期過濾）
+    if(!data||data.length===0){
+      // 備援：每日全市場行情，過濾出該股
+      const daily=await tpexFetch("tpex_mainboard_daily_close_quotes",{l:"zh-tw",d:rocDate});
+      if(daily){
+        for(const row of daily){
+          const sid=(row["SecuritiesCompanyCode"]||row["Code"]||"").trim();
+          if(sid!==stockId)continue;
+          try{
+            const c=parseFloat(String(row["Close"]||row["ClosingPrice"]||0).replace(/,/g,""));
+            const v=Math.floor(parseFloat(String(row["TradeVolume"]||row["TradingShares"]||0).replace(/,/g,""))/1000);
+            const dateStr=row["Date"]||row["d"]||"";
+            if(!isNaN(c)&&c>0&&dateStr)rows.push({date:dateStr,close:c,volume:v});
+          }catch{}
+        }
+      }
+    } else {
+      // tpex_stock_monthly_trading_info 格式
+      for(const row of data){
+        try{
+          const c=parseFloat(String(row["Close"]||row["ClosingPrice"]||row["close"]||0).replace(/,/g,""));
+          const v=Math.floor(parseFloat(String(row["TradeVolume"]||row["volume"]||0).replace(/,/g,""))/1000);
+          const dateStr=row["Date"]||row["date"]||"";
+          if(!isNaN(c)&&c>0&&dateStr)rows.push({date:dateStr,close:c,volume:v});
+        }catch{}
+      }
+    }
+    await sleep(500);
+  }
+  return buildPriceResult(stockId, rows);
+}
+
+function buildPriceResult(stockId, rows){
   if(rows.length<5)return null;
   rows.sort((a,b)=>a.date.localeCompare(b.date));
   const closes=rows.map(r=>r.close),volumes=rows.map(r=>r.volume);
@@ -538,15 +620,54 @@ async function getStockPrice(stockId){
   };
 }
 
+// ── 三大法人（自動路由）
 async function getInstitutional(stockId){
+  const market=getMarket(stockId);
+  return market==="TPEx"
+    ? getTPExInstitutional(stockId)
+    : getTWSEInstitutional(stockId);
+}
+
+async function getTWSEInstitutional(stockId){
   const months=recentMonths(2),fn=[],sn=[];
   for(const ym of months){
-    if(!_instCache[ym]){_instCache[ym]=await twseFetch(`${TWSE}/fund/T86`,{date:ym+"01",selectType:"ALLBUT0999"});await sleep(600);}
-    for(const row of(_instCache[ym]?.data||[])){
+    if(!_instCache["twse_"+ym]){
+      _instCache["twse_"+ym]=await twseFetch(`${TWSE}/fund/T86`,{date:ym+"01",selectType:"ALLBUT0999"});
+      await sleep(600);
+    }
+    for(const row of(_instCache["twse_"+ym]?.data||[])){
       if((row[0]||"").trim()!==stockId||row.length<13)continue;
       try{const c=s=>parseInt(String(s).replace(/,/g,"").replace(/[−–]/g,"-"))||0;fn.push(c(row[6]));sn.push(c(row[12]));}catch{}
     }
   }
+  return buildInstResult(stockId,fn,sn);
+}
+
+async function getTPExInstitutional(stockId){
+  const months=recentMonths(2),fn=[],sn=[];
+  for(const ym of months){
+    const cacheKey="tpex_inst_"+ym;
+    if(!_instCache[cacheKey]){
+      // TPEx 三大法人：tpex_mainboard_3insti_trading
+      const rocDate=toRocYM(ym);
+      _instCache[cacheKey]=await tpexFetch("tpex_mainboard_3insti_trading",{l:"zh-tw",d:rocDate});
+      await sleep(600);
+    }
+    for(const row of(_instCache[cacheKey]||[])){
+      const sid=(row["SecuritiesCompanyCode"]||row["Code"]||"").trim();
+      if(sid!==stockId)continue;
+      try{
+        const clean=s=>parseInt(String(s||0).replace(/,/g,"").replace(/[−–]/g,"-"))||0;
+        // TPEx 欄位：ForeignNetBuySell, SITCNetBuySell
+        fn.push(clean(row["ForeignNetBuySell"]||row["ForNet"]||0));
+        sn.push(clean(row["SITCNetBuySell"]||row["SitNet"]||0));
+      }catch{}
+    }
+  }
+  return buildInstResult(stockId,fn,sn);
+}
+
+function buildInstResult(stockId,fn,sn){
   const consec=arr=>{let c=0;for(let i=arr.length-1;i>=0;i--){if(arr[i]>0)c++;else break;}return c;};
   return{stockId,sitDays:consec(sn),foreignDays:consec(fn),
     sitBuy:sn.length?sn[sn.length-1]>0:false,
