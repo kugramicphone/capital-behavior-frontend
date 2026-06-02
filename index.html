@@ -486,10 +486,149 @@ function resetWatchlist() {
 
 // ══════════════════════════════════════════════════════
 // TWSE + TPEx 雙軌 API
+// 上市股（TWSE）：瀏覽器直連
+// 上櫃股（TPEx）：透過 Deno Deploy proxy → Yahoo Finance
 // ══════════════════════════════════════════════════════
-const TWSE="https://www.twse.com.tw/rwd/zh";
-const TPEX="https://www.tpex.org.tw/openapi/v1";
-const _instCache={};
+
+// ★ 部署後把這裡換成你的 Deno Deploy URL
+const DENO_PROXY = "https://capital-behavior-proxy-38nr436af1ve.kugramicphone.deno.net";
+
+const TWSE = "https://www.twse.com.tw/rwd/zh";
+const _instCache = {};
+
+function recentMonths(n) {
+  const r = [], d = new Date();
+  for (let i = 0; i < n; i++) {
+    r.push(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`);
+    d.setMonth(d.getMonth() - 1);
+  }
+  return r;
+}
+
+async function twseFetch(url, params = {}) {
+  const qs = new URLSearchParams({ ...params, response: "json" }).toString();
+  for (let i = 0; i < 3; i++) {
+    try {
+      if (i > 0) await sleep(800 * i);
+      const r = await fetch(`${url}?${qs}`, {
+        headers: { "Accept": "application/json", "Referer": "https://www.twse.com.tw/" },
+        mode: "cors",
+      });
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (d?.stat === "OK" || d?.data) return d;
+    } catch {}
+  }
+  return null;
+}
+
+async function denoFetch(path) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      if (i > 0) await sleep(800 * i);
+      const r = await fetch(`${DENO_PROXY}${path}`);
+      if (!r.ok) continue;
+      return await r.json();
+    } catch {}
+  }
+  return null;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function getMarket(stockId) {
+  return stockMap[stockId]?.market || "TWSE";
+}
+
+// ── 個股日K（自動路由）
+async function getStockPrice(stockId) {
+  return getMarket(stockId) === "TPEx"
+    ? getTPExStockPrice(stockId)
+    : getTWSEStockPrice(stockId);
+}
+
+async function getTWSEStockPrice(stockId) {
+  const months = recentMonths(3), rows = [];
+  for (const ym of months) {
+    const data = await twseFetch(`${TWSE}/afterTrading/STOCK_DAY`, { stockNo: stockId, date: ym + "01" });
+    for (const row of (data?.data || [])) {
+      try {
+        const c = parseFloat(row[6].replace(/,/g, "")),
+              v = Math.floor(parseInt(row[1].replace(/,/g, "")) / 1000);
+        if (!isNaN(c) && c > 0) rows.push({ date: row[0], close: c, volume: v });
+      } catch {}
+    }
+    await sleep(400);
+  }
+  return buildPriceResult(stockId, rows);
+}
+
+async function getTPExStockPrice(stockId) {
+  // 透過 Deno Deploy → Yahoo Finance
+  const data = await denoFetch(`/tpex/price/${stockId}`);
+  if (!data || data.error) return null;
+  return data; // 已是完整的 price 結構
+}
+
+function buildPriceResult(stockId, rows) {
+  if (rows.length < 5) return null;
+  rows.sort((a, b) => a.date.localeCompare(b.date));
+  const closes = rows.map(r => r.close), volumes = rows.map(r => r.volume);
+  const latest = rows[rows.length - 1], prev = rows[rows.length - 2] || latest;
+  const avg = (arr, n) => arr.length >= n ? arr.slice(-n).reduce((s, v) => s + v, 0) / n : null;
+  return {
+    stockId, price: latest.close,
+    changePct: +(((latest.close - prev.close) / prev.close) * 100).toFixed(2),
+    above20ma: avg(closes, 20) ? latest.close > avg(closes, 20) : null,
+    ma20: avg(closes, 20) ? +avg(closes, 20).toFixed(2) : null,
+    ma60: avg(closes, 60) ? +avg(closes, 60).toFixed(2) : null,
+    vol5avg:  avg(volumes, 5)  ? Math.round(avg(volumes, 5))  : null,
+    vol20avg: avg(volumes, 20) ? Math.round(avg(volumes, 20)) : null,
+    dataDate: latest.date,
+  };
+}
+
+// ── 三大法人（自動路由）
+async function getInstitutional(stockId) {
+  return getMarket(stockId) === "TPEx"
+    ? getTPExInstitutional(stockId)
+    : getTWSEInstitutional(stockId);
+}
+
+async function getTWSEInstitutional(stockId) {
+  const months = recentMonths(2), fn = [], sn = [];
+  for (const ym of months) {
+    const key = "twse_" + ym;
+    if (!_instCache[key]) {
+      _instCache[key] = await twseFetch(`${TWSE}/fund/T86`, { date: ym + "01", selectType: "ALLBUT0999" });
+      await sleep(600);
+    }
+    for (const row of (_instCache[key]?.data || [])) {
+      if ((row[0] || "").trim() !== stockId || row.length < 13) continue;
+      try {
+        const c = s => parseInt(String(s).replace(/,/g, "").replace(/[−–]/g, "-")) || 0;
+        fn.push(c(row[6])); sn.push(c(row[12]));
+      } catch {}
+    }
+  }
+  return buildInstResult(stockId, fn, sn);
+}
+
+async function getTPExInstitutional(stockId) {
+  const data = await denoFetch(`/tpex/inst/${stockId}`);
+  if (!data || data.error) return buildInstResult(stockId, [], []);
+  return data;
+}
+
+function buildInstResult(stockId, fn, sn) {
+  const consec = arr => { let c = 0; for (let i = arr.length - 1; i >= 0; i--) { if (arr[i] > 0) c++; else break; } return c; };
+  return {
+    stockId, sitDays: consec(sn), foreignDays: consec(fn),
+    sitBuy:     sn.length ? sn[sn.length - 1] > 0     : false,
+    foreignBuy: fn.length ? fn[fn.length - 1] > 0 : false,
+    recent5Sit: sn.slice(-5), recent5Foreign: fn.slice(-5),
+  };
+}
 
 function recentMonths(n){
   const r=[],d=new Date();
@@ -695,50 +834,126 @@ async function getMarketRegime(){
 }
 
 // ══════════════════════════════════════════════════════
-// 優雅降級評分引擎
+// 優雅降級評分引擎 v2 — 修正雙重人格 Bug
 // ══════════════════════════════════════════════════════
-const MODE_CONFIG={A:{ceiling:100,threshold:85},B_PLUS:{ceiling:75,threshold:64},B:{ceiling:75,threshold:64},C:{ceiling:50,threshold:43}};
-const POSITION_CAP={A_HUNT:"70%",B_TRACK:"25%",B_PROXY_TRACK:"15%",C_SCOUT:"5%",C_OBSERVE:"0%"};
+const MODE_CONFIG = {
+  A:      { ceiling:100, threshold:85 },
+  B_PLUS: { ceiling:75,  threshold:64 },
+  B:      { ceiling:75,  threshold:64 },
+  C:      { ceiling:50,  threshold:43 },
+};
+const POSITION_CAP = {
+  A_HUNT:"70%", B_TRACK:"25%", B_PROXY_TRACK:"15%",
+  C_SCOUT:"5%", C_OBSERVE:"0%",
+};
 
-function detectMode(inst){
-  if(!inst||(!inst.sitDays&&!inst.foreignDays&&!inst.recent5Sit?.length))return"C";
-  return"B";
+// ── 全域評分快取：同一支股票同一次掃描只計算一次
+// key = stockId，value = score 物件
+// 每次 runScan() 開始時清空
+const _scoreCache = {};
+
+function detectMode(inst) {
+  if (!inst || (!inst.sitDays && !inst.foreignDays && !(inst.recent5Sit?.length))) return "C";
+  return "B";
 }
 
-function normalizeScore(raw,mode){
-  const ceil=MODE_CONFIG[mode]?.ceiling??100;
-  return Math.min((raw/ceil)*100,100);
+function normalizeScore(raw, mode) {
+  // ★ 修正：動態查天花板，不再寫死 75
+  const ceiling = MODE_CONFIG[mode]?.ceiling ?? 50;
+  return Math.min((raw / ceiling) * 100, 100);
 }
 
-function calcScore(price,inst){
-  if(!price)return null;
-  const mode=detectMode(inst);
-  const rs=price.changePct||0,above=price.above20ma||false;
-  const vr=(price.vol5avg&&price.vol20avg)?price.vol5avg/price.vol20avg:1;
-  const{sitDays=0,foreignDays=0,sitBuy=false}=inst||{};
-  const rsScore=rs>=3&&above?25:rs>=1?18:rs>=0?10:0;
-  const instScore=sitDays>=3?15:foreignDays>=3&&!sitBuy?8:sitDays*1.5+foreignDays*0.5>=3?10:sitDays*1.5+foreignDays*0.5>=1?5:0;
-  const healthScore=vr<=0.7?20:vr<=0.85?12:6;
-  let chipsScore=mode==="C"?0:mode==="A"?(sitDays>=3?22:sitDays>=2?18:foreignDays>=3?14:8):(sitDays>=1?10:foreignDays>=1?6:3);
-  const raw=Math.min(rsScore+chipsScore+instScore+healthScore+15,100);
-  const norm=normalizeScore(raw,mode);
-  const thr=MODE_CONFIG[mode]?.threshold??85;
-  let dm,maxPos;
-  if(mode==="A"){dm="A_HUNT";maxPos=POSITION_CAP.A_HUNT;}
-  else if(mode==="B_PLUS"){dm="B_TRACK";maxPos=POSITION_CAP.B_TRACK;}
-  else if(mode==="B"){dm="B_PROXY_TRACK";maxPos=POSITION_CAP.B_PROXY_TRACK;}
-  else if(norm>=85&&above){dm="C_SCOUT";maxPos=POSITION_CAP.C_SCOUT;}
-  else{dm="C_OBSERVE";maxPos=POSITION_CAP.C_OBSERVE;}
-  const signal=norm>=thr&&dm!=="C_OBSERVE";
-  let label,color,msg;
-  if(!signal||dm==="C_OBSERVE"){label="冷眼旁觀";color="var(--txt-mut)";msg="結構條件未達標準或資料解析度不足。此時進場為盲目行動。";}
-  else if(norm>=85){
-    label=dm==="C_SCOUT"?"有限防衛試單":"等待Trigger";color="var(--green)";
-    msg=dm==="C_SCOUT"?"濃霧中偵測到強勢結構，允許 5% 試單，停損收緊 30%，嚴禁加碼。"
-      :"深海章魚正在低調完成最後收集，浮額大量消失。請保持獵人耐心，等待觸發。";
-  }else if(norm>=75){label="籌碼沉澱中";color="var(--blue)";msg=sitDays>=2?"深海章魚正在低調收集，市場尚未察覺。請保持獵人耐心，切勿提早追價。":"主力足跡清晰，籌碼結構健康。等待量縮完成後的突破訊號。";}
-  else{label="疑似吸籌";color="var(--amber)";msg="有潛在主力跡象，但結構尚未成熟。列入觀察名單持續追蹤。";}
-  return{total:Math.round(norm),raw,label,color,msg,mode,dm,maxPos,scores:{rsScore,chipsScore,instScore,healthScore,liquidScore:15},volRatio:vr.toFixed(2)};
+function calcScore(price, inst) {
+  if (!price) return null;
+
+  // ── 快取命中：同一支股票本次掃描已算過，直接回傳
+  const cacheKey = price.stockId;
+  if (cacheKey && _scoreCache[cacheKey]) return _scoreCache[cacheKey];
+
+  const mode   = detectMode(inst);
+  const rs     = price.changePct || 0;
+  const above  = price.above20ma || false;
+  const vr     = (price.vol5avg && price.vol20avg)
+                 ? price.vol5avg / price.vol20avg : 1;
+  const { sitDays=0, foreignDays=0, sitBuy=false } = inst || {};
+
+  // ── 各維度原始分
+  const rsScore     = rs>=3&&above ? 25 : rs>=1 ? 18 : rs>=0 ? 10 : 0;
+  const instScore   = sitDays>=3   ? 15
+                    : foreignDays>=3&&!sitBuy ? 8
+                    : sitDays*1.5+foreignDays*0.5>=3 ? 10
+                    : sitDays*1.5+foreignDays*0.5>=1 ? 5 : 0;
+  const healthScore = vr<=0.7 ? 20 : vr<=0.85 ? 12 : 6;
+
+  // B/C 模式：籌碼維度保守處理
+  const chipsScore = mode==="C" ? 0
+                   : mode==="A" ? (sitDays>=3?22:sitDays>=2?18:foreignDays>=3?14:8)
+                   : (sitDays>=1 ? 10 : foreignDays>=1 ? 6 : 3); // B 模式保守
+
+  const raw  = Math.min(rsScore + chipsScore + instScore + healthScore + 15, 100);
+  const norm = normalizeScore(raw, mode);
+  const thr  = MODE_CONFIG[mode]?.threshold ?? 85;
+
+  // ── 決策模式狀態機（完全體三道鎖）
+  // 使用全域 regime 判斷市場環境（已在 runScan 取得）
+  const isWarmMarket = regime?.regime === "溫床市場";
+
+  let dm, maxPos;
+  if (mode === "A") {
+    dm = "A_HUNT";
+    maxPos = POSITION_CAP.A_HUNT;
+  } else if (mode === "B_PLUS") {
+    // B+ 只在分數夠高時允許跟蹤，否則觀望
+    dm = norm >= thr ? "B_TRACK" : "C_OBSERVE";
+    maxPos = dm === "B_TRACK" ? POSITION_CAP.B_TRACK : POSITION_CAP.C_OBSERVE;
+  } else if (mode === "B") {
+    // B 模式：分數達標才允許代理跟蹤
+    dm = norm >= thr ? "B_PROXY_TRACK" : "C_OBSERVE";
+    maxPos = dm === "B_PROXY_TRACK" ? POSITION_CAP.B_PROXY_TRACK : POSITION_CAP.C_OBSERVE;
+  } else {
+    // ★ C 模式三道鎖：溫床市場 + 正規化高分 + 收盤在 20MA 之上
+    if (isWarmMarket && norm >= 85 && above) {
+      dm = "C_SCOUT";
+      maxPos = POSITION_CAP.C_SCOUT;
+    } else {
+      dm = "C_OBSERVE";
+      maxPos = POSITION_CAP.C_OBSERVE;
+    }
+  }
+
+  const signal = norm >= thr && dm !== "C_OBSERVE";
+
+  // ── 語意翻譯
+  let label, color, msg;
+  if (!signal || dm === "C_OBSERVE") {
+    label = "冷眼旁觀"; color = "var(--txt-mut)";
+    msg   = "結構條件未達標準或資料解析度不足。此時進場為盲目行動。";
+  } else if (norm >= 85) {
+    label = dm === "C_SCOUT" ? "有限防衛試單" : "等待Trigger";
+    color = "var(--green)";
+    msg   = dm === "C_SCOUT"
+      ? "濃霧中偵測到強勢結構，允許 5% 試單，停損收緊 30%，嚴禁加碼。"
+      : "深海章魚正在低調完成最後收集，浮額大量消失。請保持獵人耐心，等待觸發。";
+  } else if (norm >= 75) {
+    label = "籌碼沉澱中"; color = "var(--blue)";
+    msg   = sitDays >= 2
+      ? "深海章魚正在低調收集，市場尚未察覺。請保持獵人耐心，切勿提早追價。"
+      : "主力足跡清晰，籌碼結構健康。等待量縮完成後的突破訊號。";
+  } else {
+    label = "疑似吸籌"; color = "var(--amber)";
+    msg   = "有潛在主力跡象，但結構尚未成熟。列入觀察名單持續追蹤。";
+  }
+
+  const result = {
+    total: Math.round(norm), raw, label, color, msg,
+    mode, dm, maxPos,
+    scores: { rsScore, chipsScore, instScore, healthScore, liquidScore:15 },
+    volRatio: vr.toFixed(2),
+  };
+
+  // ── 存入快取，同一次掃描不重複計算
+  if (cacheKey) _scoreCache[cacheKey] = result;
+  return result;
 }
 
 // ══════════════════════════════════════════════════════
@@ -789,7 +1004,9 @@ async function scanOne(sid, meta={}) {
 
 async function runScan(){
   setLoading(true); setError(null); stockData=[]; renderResults();
+  // 清空法人快取與評分快取，確保每次掃描都是乾淨的
   Object.keys(_instCache).forEach(k=>delete _instCache[k]);
+  Object.keys(_scoreCache).forEach(k=>delete _scoreCache[k]);
   try{
     setMsg("取得大盤環境…");
     regime = await getMarketRegime();
