@@ -226,6 +226,10 @@
       <div class="progress-track"><div class="progress-bar"></div></div>
       <div class="loading-msg" id="loading-msg">載入中…</div>
     </div>
+    <!-- 快取狀態提示列 -->
+    <div id="cache-hint" style="display:none;padding:9px 14px;margin-bottom:10px;
+      background:#f0fdf4;border:1px solid rgba(5,156,85,0.3);border-radius:8px;
+      font-size:12px;color:var(--green);font-weight:600"></div>
     <div class="error-box" id="error-box" style="display:none"></div>
     <div id="results-list"></div>
   </div>
@@ -1075,18 +1079,37 @@ function calcMigrationFromCache(){
 // ══════════════════════════════════════════════════════
 // 作戰群組切換
 // ══════════════════════════════════════════════════════
-async function changeBattlefield(groupKey, btn){
+async function changeBattlefield(groupKey, btn) {
   currentBF = groupKey;
-  saveBattlefield(groupKey);   // ← 記住上次選的群組
-  ["core","risk_on","risk_off"].forEach(k=>{
+  saveBattlefield(groupKey);
+  ["core","risk_on","risk_off"].forEach(k => {
     const b = document.getElementById(`bf-${k}`);
-    if(b) b.className = `bf-pill${k===groupKey ? ` active-${k}` : ""}`;
+    if (b) b.className = `bf-pill${k===groupKey ? ` active-${k}` : ""}`;
   });
-  if(groupKey==="core") watchlist = [...CORE_RADAR];
-  else watchlist = [...BATTLEFIELDS[groupKey]];
-  saveWatchlist();             // ← 切換群組時同步存檔
+
+  if (groupKey === "core") {
+    // 核心雷達：讀 localStorage，沒有才用預設
+    const saved = loadSavedWatchlist();
+    const enrichName = arr => arr.map(s=>({...s,name:stockMap[s.id]?.name||s.name}));
+    watchlist = saved
+      ? saved.map(s=>({...s,name:stockMap[s.id]?.name||s.name||s.id}))
+      : enrichName([...CORE_RADAR]);
+  } else {
+    // risk_on / risk_off：永遠用系統定義，不儲存到 localStorage
+    watchlist = [...BATTLEFIELDS[groupKey]]
+      .map(s=>({...s,name:stockMap[s.id]?.name||s.name}));
+  }
+
   renderWatchlist();
-  await runScan();
+
+  // risk_on / risk_off 有今日快取則直接顯示，否則掃描
+  if (groupKey !== "core" && isBgCacheFresh(groupKey)) {
+    stockData = getBgCacheData(groupKey);
+    renderResults();
+    renderMigration(calcMigrationFromCache());
+  } else {
+    await runScan();
+  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -1188,7 +1211,9 @@ function cardHTML(d){
       <div class="warn-box">
         ⚠️ 目前運行於 <b>${s.mode} 模式</b>，籌碼動向以法人月彙總代替分點資料計算。
         ${s.dm==="C_SCOUT"?"<br>🔴 <b>C_SCOUT：最多 5% 試單，停損收緊 30%，禁止加碼。</b>":""}
+        ${s.branchEnhanced?`<br>🟣 <b>分點資料已套用，Weighted CR5 = ${s.wCR5}%，評分已升級至 A 模式精度。</b>`:""}
       </div>
+      ${branchInputHTML(stockId, loadBranchNotes()[stockId]||null)}
     </div>`;
   }
 
@@ -1226,61 +1251,332 @@ function cardHTML(d){
 function toggleCard(id){expandedId=expandedId===id?null:id;renderResults();}
 
 // ══════════════════════════════════════════════════════
-// UI HELPERS
+// 分點資料手動輸入（localStorage 持久化）
 // ══════════════════════════════════════════════════════
-function setLoading(on){
-  document.getElementById("btn-scan").disabled=on;
-  document.getElementById("btn-scan").textContent=on?"掃描中…":"▶ 開始掃描";
-  document.getElementById("loading-box").style.display=on?"block":"none";
+const LS_BRANCH = "cbv2_branch_notes"; // { stockId: [{branch,netBuy,dtps},...] }
+
+function loadBranchNotes() {
+  try { return JSON.parse(localStorage.getItem(LS_BRANCH) || "{}"); } catch { return {}; }
 }
-function setMsg(msg){document.getElementById("loading-msg").textContent=msg;}
-function setError(msg){const el=document.getElementById("error-box");el.style.display=msg?"block":"none";if(msg)el.innerHTML=`⚠️ ${msg}`;}
-function setFilter(mode,btn){filterMode=mode;document.querySelectorAll(".pill").forEach(p=>p.classList.remove("active"));btn.classList.add("active");renderResults();}
-function switchTab(tab,btn){
-  document.getElementById("tab-scanner").style.display=tab==="scanner"?"block":"none";
-  document.getElementById("tab-watchlist").style.display=tab==="watchlist"?"block":"none";
-  document.querySelectorAll(".tab-btn").forEach(b=>b.classList.remove("active"));
-  if(btn)btn.classList.add("active");
-  if(tab==="watchlist")renderWatchlist();
+function saveBranchNote(stockId, branches) {
+  const all = loadBranchNotes();
+  all[stockId] = branches;
+  try { localStorage.setItem(LS_BRANCH, JSON.stringify(all)); } catch {}
+}
+function deleteBranchNote(stockId) {
+  const all = loadBranchNotes();
+  delete all[stockId];
+  try { localStorage.setItem(LS_BRANCH, JSON.stringify(all)); } catch {}
+}
+
+// 解析從國泰 APP 複製的分點文字
+// 支援格式：「凱基台北 買超 8,500 張」或「凱基台北 +8500」等常見格式
+function parseBranchText(text) {
+  const lines = text.split(/[\n,，;；]+/).map(l => l.trim()).filter(Boolean);
+  const results = [];
+  for (const line of lines) {
+    // 嘗試解析：券商名稱 + 數字（張數）
+    const m = line.match(/^(.{2,10}?)\s*[買+＋]\s*超?\s*([0-9,，]+)\s*張?$/);
+    if (m) {
+      const branch  = m[1].trim();
+      const netBuy  = parseInt(m[2].replace(/[,，]/g, ""));
+      if (!isNaN(netBuy) && netBuy > 0) {
+        results.push({ branch, netBuy, dtps: 30 }); // 預設 dtps=30（混合型）
+      }
+    }
+  }
+  return results;
+}
+
+// 計算有分點資料時的加強籌碼分數
+function calcChipsWithBranch(branches, vol20avg) {
+  if (!branches || !branches.length) return null;
+  const qwMap = { 0: 0.1, 30: 0.5, 100: 1.0 }; // dtps → qw
+  const getQw = dtps => dtps > 70 ? 0.1 : dtps >= 30 ? 0.5 : 1.0;
+  const totalNetBuy = branches.reduce((s, b) => s + b.netBuy, 0);
+  const weightedBuy = branches.reduce((s, b) => s + b.netBuy * getQw(b.dtps), 0);
+  const vol = vol20avg || 10000;
+  const wCR5 = Math.min((weightedBuy / (vol * 5)) * 100, 100);
+  const dtRatio = branches.filter(b => b.dtps > 70).length / branches.length;
+  const isWolf  = dtRatio >= 0.5;
+  if (isWolf) return { score: 5, label: "假抗跌警告", wCR5, isWolf: true };
+  if (wCR5 >= 30) return { score: 25, label: "主力積極吸籌", wCR5, isWolf: false };
+  if (wCR5 >= 20) return { score: 18, label: "籌碼適度集中", wCR5, isWolf: false };
+  return { score: 10, label: "籌碼輕微集中", wCR5, isWolf: false };
+}
+
+// 分點輸入框 HTML（嵌入展開卡片）
+function branchInputHTML(stockId, savedBranches) {
+  const hasData = savedBranches && savedBranches.length > 0;
+  const preview = hasData
+    ? savedBranches.slice(0, 3).map(b =>
+        `<span style="font-size:11px;color:var(--txt-sec);background:var(--bg-section);
+         padding:2px 8px;border-radius:10px;border:1px solid var(--border)">
+         ${b.branch} +${b.netBuy.toLocaleString()}張</span>`
+      ).join(" ")
+    : "";
+
+  return `<div class="data-section" style="margin-top:10px">
+    <div class="sec-title" style="color:var(--purple)">◈ 分點資料（手動輸入）
+      <span style="font-size:10px;font-weight:400;color:var(--txt-mut)">
+        — 從國泰 APP 複製後貼入，可提升籌碼評分精度
+      </span>
+    </div>
+    ${hasData ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px">${preview}</div>` : ""}
+    <textarea id="branch-input-${stockId}"
+      placeholder="範例：&#10;凱基台北 買超 8,500 張&#10;元大信義 買超 6,200 張&#10;（每行一個分點）"
+      style="width:100%;height:90px;border:1px solid var(--border);border-radius:8px;
+        padding:8px 10px;font-size:12px;font-family:monospace;color:var(--txt-pri);
+        background:var(--bg-section);resize:none;outline:none;line-height:1.6"
+      onclick="event.stopPropagation()"
+    >${hasData ? savedBranches.map(b=>`${b.branch} 買超 ${b.netBuy.toLocaleString()} 張`).join("\n") : ""}</textarea>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <button onclick="event.stopPropagation();applyBranchInput('${stockId}')"
+        style="padding:6px 14px;border-radius:6px;border:none;
+          background:var(--purple);color:#fff;cursor:pointer;
+          font-size:12px;font-family:inherit;font-weight:700">
+        ✓ 套用分點資料
+      </button>
+      ${hasData ? `<button onclick="event.stopPropagation();clearBranchInput('${stockId}')"
+        style="padding:6px 12px;border-radius:6px;border:1px solid var(--border);
+          background:var(--bg-section);color:var(--txt-mut);cursor:pointer;
+          font-size:12px;font-family:inherit">✕ 清除</button>` : ""}
+    </div>
+    ${hasData ? `<div style="font-size:11px;color:var(--green);margin-top:4px">
+      ✅ 已套用 ${savedBranches.length} 個分點資料，籌碼分數已提升</div>` : ""}
+  </div>`;
+}
+
+function applyBranchInput(stockId) {
+  const ta  = document.getElementById(`branch-input-${stockId}`);
+  const txt = ta?.value || "";
+  const branches = parseBranchText(txt);
+  if (!branches.length) {
+    alert("格式解析失敗，請確認格式為：\n券商名稱 買超 張數 張\n例如：凱基台北 買超 8500 張");
+    return;
+  }
+  saveBranchNote(stockId, branches);
+  // 清除該股評分快取，強制重算
+  delete _scoreCache[stockId];
+  // 重新渲染（用已存的 price/inst 數據加入分點重算）
+  const existing = stockData.find(d => d.stockId === stockId);
+  if (existing) {
+    existing.branchData = branches;
+    existing.score = calcScoreWithBranch(existing.price, existing.inst, branches);
+    renderResults();
+  }
+}
+
+function clearBranchInput(stockId) {
+  deleteBranchNote(stockId);
+  delete _scoreCache[stockId];
+  const existing = stockData.find(d => d.stockId === stockId);
+  if (existing) {
+    delete existing.branchData;
+    existing.score = calcScore(existing.price, existing.inst);
+    renderResults();
+  }
+}
+
+// 含分點資料的強化評分（接近 A 模式精度）
+function calcScoreWithBranch(price, inst, branches) {
+  if (!price || !branches?.length) return calcScore(price, inst);
+  const branchResult = calcChipsWithBranch(branches, price.vol20avg);
+  if (!branchResult) return calcScore(price, inst);
+
+  const mode = "A"; // 有分點資料，升級到 A 模式精度
+  const rs    = price.changePct || 0;
+  const above = price.above20ma || false;
+  const vr    = (price.vol5avg && price.vol20avg) ? price.vol5avg / price.vol20avg : 1;
+  const { sitDays=0, foreignDays=0, sitBuy=false } = inst || {};
+
+  const rsScore     = rs>=3&&above?25: rs>=1?18: rs>=0?10:0;
+  const instScore   = sitDays>=3?15: foreignDays>=3&&!sitBuy?8:
+                      sitDays*1.5+foreignDays*0.5>=3?10: sitDays*1.5+foreignDays*0.5>=1?5:0;
+  const healthScore = vr<=0.7?20: vr<=0.85?12:6;
+  const chipsScore  = branchResult.isWolf ? 5 : branchResult.score;
+
+  const raw  = Math.min(rsScore + chipsScore + instScore + healthScore + 15, 100);
+  const norm = normalizeScore(raw, "A"); // A 模式天花板 100
+
+  const isWarmMarket = regime?.regime === "溫床市場";
+  let dm, maxPos;
+  if (norm >= 85) { dm = "A_HUNT"; maxPos = POSITION_CAP.A_HUNT; }
+  else { dm = "B_TRACK"; maxPos = POSITION_CAP.B_TRACK; }
+
+  let label, color, msg;
+  if (branchResult.isWolf) {
+    label="剔除 / 假抗跌"; color="var(--red)";
+    msg="今日抗跌實為假象，背後堆手為隔日沖狼群，此為拉高倒貨埋伏盤。主力無波段野心，嚴禁列入名單，無情剔除。";
+  } else if (norm >= 85) {
+    label="等待Trigger"; color="var(--green)";
+    msg="分點資料確認主力積極吸籌，籌碼集中度達標。深海章魚已完成收集，等待觸發。";
+  } else if (norm >= 75) {
+    label="籌碼沉澱中"; color="var(--blue)";
+    msg="分點資料顯示主力持續建倉，浮額正在消失。保持耐心，等待量縮完成。";
+  } else {
+    label="疑似吸籌"; color="var(--amber)";
+    msg="分點資料顯示有主力跡象，但集中度尚未達標。持續觀察。";
+  }
+
+  return {
+    total: Math.round(norm), raw, label, color, msg,
+    mode: "A（分點加強）", dm, maxPos,
+    scores: { rsScore, chipsScore, instScore, healthScore, liquidScore:15 },
+    volRatio: vr.toFixed(2),
+    branchEnhanced: true,
+    wCR5: branchResult.wCR5?.toFixed(1),
+  };
 }
 
 // ══════════════════════════════════════════════════════
-// INIT
+// 背景群組掃描快取（含日期戳記）
+// ══════════════════════════════════════════════════════
+const LS_BG_CACHE   = "cbv2_bg_cache";   // { risk_on: {date, data[]}, risk_off: {date, data[]} }
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function loadBgCache() {
+  try { return JSON.parse(localStorage.getItem(LS_BG_CACHE) || "{}"); } catch { return {}; }
+}
+function saveBgCache(key, data) {
+  const all = loadBgCache();
+  all[key] = { date: todayStr(), data };
+  try { localStorage.setItem(LS_BG_CACHE, JSON.stringify(all)); } catch {}
+}
+function isBgCacheFresh(key) {
+  const all = loadBgCache();
+  return all[key]?.date === todayStr() && Array.isArray(all[key]?.data) && all[key].data.length > 0;
+}
+function getBgCacheData(key) {
+  return loadBgCache()[key]?.data || [];
+}
+
+// ══════════════════════════════════════════════════════
+// UI HELPERS
+// ══════════════════════════════════════════════════════
+function setLoading(on) {
+  document.getElementById("btn-scan").disabled = on;
+  document.getElementById("btn-scan").textContent = on ? "掃描中…" : "▶ 開始掃描";
+  document.getElementById("loading-box").style.display = on ? "block" : "none";
+}
+function setMsg(msg) { document.getElementById("loading-msg").textContent = msg; }
+function setError(msg) {
+  const el = document.getElementById("error-box");
+  el.style.display = msg ? "block" : "none";
+  if (msg) el.innerHTML = `⚠️ ${msg}`;
+}
+function setFilter(mode, btn) {
+  filterMode = mode;
+  document.querySelectorAll(".pill").forEach(p => p.classList.remove("active"));
+  btn.classList.add("active");
+  renderResults();
+}
+function switchTab(tab, btn) {
+  document.getElementById("tab-scanner").style.display  = tab==="scanner"  ? "block" : "none";
+  document.getElementById("tab-watchlist").style.display = tab==="watchlist" ? "block" : "none";
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  if (btn) btn.classList.add("active");
+  if (tab === "watchlist") renderWatchlist();
+}
+
+// ══════════════════════════════════════════════════════
+// INIT — 智慧啟動流程
 // ══════════════════════════════════════════════════════
 document.addEventListener("DOMContentLoaded", async () => {
   await loadStockList();
 
-  // 用 TWSE 對照表補全內建群組名稱
+  // 補全群組名稱
   const enrichName = arr => arr.map(s => ({...s, name: stockMap[s.id]?.name || s.name}));
-  CORE_RADAR.forEach((s,i) => { if(stockMap[s.id]) CORE_RADAR[i].name = stockMap[s.id].name; });
+  CORE_RADAR.forEach((s,i) => { if (stockMap[s.id]) CORE_RADAR[i].name = stockMap[s.id].name; });
   Object.keys(BATTLEFIELDS).forEach(k => { BATTLEFIELDS[k] = enrichName(BATTLEFIELDS[k]); });
 
-  // 恢復上次選擇的作戰群組
+  // 恢復作戰群組
   const savedBF = loadSavedBattlefield();
   currentBF = savedBF;
   ["core","risk_on","risk_off"].forEach(k => {
     const b = document.getElementById(`bf-${k}`);
-    if(b) b.className = `bf-pill${k===savedBF ? ` active-${k}` : ""}`;
+    if (b) b.className = `bf-pill${k===savedBF ? ` active-${k}` : ""}`;
   });
 
-  // 恢復儲存的觀察名單
-  // 優先順序：localStorage 儲存 > 群組預設值
-  const saved = loadSavedWatchlist();
-  if (saved) {
-    // 補全名稱（用 stockMap 覆蓋，確保名稱是最新的）
-    watchlist = saved.map(s => ({
-      ...s,
-      name: stockMap[s.id]?.name || s.name || s.id,
-    }));
+  // ★ 核心雷達觀察名單：嚴格只從 localStorage 讀取
+  //   risk_on / risk_off 群組則永遠用系統定義，不允許自訂
+  if (savedBF === "core") {
+    const saved = loadSavedWatchlist();
+    watchlist = saved
+      ? saved.map(s => ({...s, name: stockMap[s.id]?.name || s.name || s.id}))
+      : enrichName([...CORE_RADAR]);
   } else {
-    // 第一次開啟，用群組預設值
-    if (savedBF === "core") watchlist = [...CORE_RADAR];
-    else watchlist = enrichName([...BATTLEFIELDS[savedBF]]);
+    // risk_on / risk_off：永遠用系統定義（不儲存使用者修改）
+    watchlist = enrichName([...BATTLEFIELDS[savedBF]]);
+  }
+  renderWatchlist();
+
+  // ── 智慧啟動：檢查 risk_on / risk_off 快取是否為今日
+  const onFresh  = isBgCacheFresh("risk_on");
+  const offFresh = isBgCacheFresh("risk_off");
+
+  if (onFresh && offFresh) {
+    // 兩組都是今日資料 → 直接載入快取，顯示遷徙雷達，不自動掃描
+    const onData  = getBgCacheData("risk_on");
+    const offData = getBgCacheData("risk_off");
+    _bgCache.risk_on  = onData;
+    _bgCache.risk_off = offData;
+    renderMigration(calcMigrationFromCache());
+
+    // 顯示上次掃描日期提示
+    setError(null);
+    document.getElementById("loading-box").style.display = "none";
+    const hint = document.getElementById("cache-hint");
+    if (hint) {
+      hint.textContent = `⚡ 遷徙雷達已載入今日快取（${todayStr().slice(0,4)}/${todayStr().slice(4,6)}/${todayStr().slice(6,8)}）`;
+      hint.style.display = "block";
+    }
+  } else {
+    // 有任一組不是今日 → 自動背景掃描兩組，然後等使用者手動掃核心雷達
+    autoScanBothGroups();
+  }
+});
+
+// 自動掃描 risk_on 和 risk_off（不影響主畫面）
+async function autoScanBothGroups() {
+  const hint = document.getElementById("cache-hint");
+  if (hint) { hint.textContent = "⏳ 正在自動掃描 Risk-On 與 Risk-Off 群組，請稍候…"; hint.style.display = "block"; }
+
+  // 先取得大盤環境（評分需要）
+  try { regime = await getMarketRegime(); renderRegime(regime); renderRegimeSuggest(regime); } catch {}
+
+  for (const groupKey of ["risk_on", "risk_off"]) {
+    if (isBgCacheFresh(groupKey)) {
+      // 已是今日，直接用快取
+      _bgCache[groupKey] = getBgCacheData(groupKey);
+      renderMigration(calcMigrationFromCache());
+      continue;
+    }
+    const group = BATTLEFIELDS[groupKey];
+    const results = [];
+    for (const s of group) {
+      if (hint) hint.textContent = `⏳ 掃描 ${groupKey==="risk_on"?"🚀 Risk-On":"🛡️ Risk-Off"} … ${s.name}(${s.id})`;
+      const result = await scanOne(s.id, s);
+      if (result) {
+        results.push(result);
+        _bgCache[groupKey] = [...results];
+        renderMigration(calcMigrationFromCache());
+      }
+      await sleep(600);
+    }
+    saveBgCache(groupKey, results); // 存入今日快取
   }
 
-  renderWatchlist();
-  runScan();
-});
+  if (hint) {
+    hint.textContent = "✅ 兩群組掃描完成，遷徙雷達已更新。請手動點「▶ 開始掃描」掃描核心雷達。";
+    hint.style.color = "var(--green)";
+  }
+}
+
 </script>
 </body>
 </html>
