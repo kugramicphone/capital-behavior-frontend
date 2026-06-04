@@ -4,6 +4,8 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>資金行為學 · 認知戰情室</title>
+  <!-- PDF 解析器：用於解析國泰 APP 匯出的分點 PDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <style>
     * { box-sizing:border-box; margin:0; padding:0; }
     :root {
@@ -144,6 +146,49 @@
 
     .footer { text-align:center; padding:20px; font-size:10px; color:var(--txt-mut); border-top:1px solid var(--border); margin-top:40px; }
     @media (max-width:480px) { .score-bars { grid-template-columns:1fr; } .metrics-grid { grid-template-columns:1fr 1fr; } }
+
+    /* ── 分點資料標籤頁 ── */
+    .branch-tabs { display:flex; gap:4px; margin-bottom:10px; flex-wrap:wrap; }
+    .branch-tab {
+      padding:5px 12px; border-radius:20px; border:1px solid var(--border);
+      background:var(--bg-card); color:var(--txt-mut); font-size:11px;
+      font-family:inherit; cursor:pointer; transition:all 0.15s; white-space:nowrap;
+    }
+    .branch-tab.active { border-color:var(--purple); background:rgba(124,58,237,0.1); color:var(--purple); font-weight:700; }
+    .branch-tab.has-data::after { content:"●"; font-size:7px; margin-left:4px; color:var(--green); }
+    .branch-tab.veto-active { border-color:var(--red); color:var(--red); background:rgba(220,38,38,0.08); }
+
+    /* ── 分點上傳區 ── */
+    .branch-upload-zone {
+      border:2px dashed var(--border); border-radius:10px; padding:16px;
+      text-align:center; cursor:pointer; transition:all 0.2s; background:var(--bg-section);
+    }
+    .branch-upload-zone:hover, .branch-upload-zone.drag-over {
+      border-color:var(--purple); background:rgba(124,58,237,0.05);
+    }
+    .branch-upload-icon { font-size:24px; margin-bottom:6px; }
+    .branch-upload-text { font-size:12px; color:var(--txt-sec); }
+    .branch-upload-hint { font-size:10px; color:var(--txt-mut); margin-top:3px; }
+
+    /* ── 分點解析結果 ── */
+    .branch-result { margin-top:10px; }
+    .branch-row { display:flex; align-items:center; gap:8px; padding:7px 0; border-bottom:1px solid var(--border); }
+    .branch-name { flex:1; font-size:12px; color:var(--txt-pri); }
+    .branch-buy  { font-size:12px; font-family:monospace; font-weight:700; min-width:60px; text-align:right; }
+    .branch-dtps-badge { font-size:10px; font-weight:700; border-radius:10px; padding:2px 8px; border:1px solid; white-space:nowrap; }
+    .branch-qw   { font-size:10px; color:var(--txt-mut); min-width:36px; text-align:right; }
+
+    /* ── 分點分析摘要 ── */
+    .branch-summary {
+      margin-top:8px; padding:10px 12px;
+      background:var(--bg-card); border:1px solid var(--border); border-radius:8px;
+    }
+    .branch-summary-row { display:flex; justify-content:space-between; font-size:11px; margin-bottom:4px; }
+    .branch-veto-banner {
+      margin-top:8px; padding:8px 12px; border-radius:7px;
+      background:#fff5f5; border:1px solid rgba(220,38,38,0.4);
+      font-size:11px; color:var(--red); font-weight:600; line-height:1.6;
+    }
   </style>
 </head>
 <body>
@@ -495,7 +540,7 @@ function resetWatchlist() {
 // ══════════════════════════════════════════════════════
 
 // ★ 部署後把這裡換成你的 Deno Deploy URL
-const DENO_PROXY = "https://capital-behavior-proxy-38nr436af1ve.kugramicphone.deno.net";
+const DENO_PROXY = "https://capital-behavior-proxy.deno.dev";
 
 const TWSE = "https://www.twse.com.tw/rwd/zh";
 const _instCache = {};
@@ -889,10 +934,27 @@ function calcScore(price, inst) {
                     : sitDays*1.5+foreignDays*0.5>=1 ? 5 : 0;
   const healthScore = vr<=0.7 ? 20 : vr<=0.85 ? 12 : 6;
 
-  // B/C 模式：籌碼維度保守處理
-  const chipsScore = mode==="C" ? 0
-                   : mode==="A" ? (sitDays>=3?22:sitDays>=2?18:foreignDays>=3?14:8)
-                   : (sitDays>=1 ? 10 : foreignDays>=1 ? 6 : 3); // B 模式保守
+  // ── 檢查是否有分點資料，有則升級評分
+  const branchResult = calcBranchScore(price.stockId || cacheKey, price.vol20avg);
+
+  let chipsScore;
+  let vetoActive = false;
+
+  if (branchResult) {
+    // A 模式：分點資料完整，使用四視窗籌碼分數
+    chipsScore  = branchResult.totalChips;
+    vetoActive  = branchResult.veto?.veto || false;
+  } else if (mode === "C") {
+    chipsScore = 0;
+  } else if (mode === "A") {
+    chipsScore = sitDays>=3?22: sitDays>=2?18: foreignDays>=3?14:8;
+  } else {
+    chipsScore = sitDays>=1 ? 10 : foreignDays>=1 ? 6 : 3;
+  }
+
+  // 1日否決：扣分已在 calcBranchScore 裡的 vetoPenalty 處理
+  // 這裡額外：若觸發否決且沒有分點加強，強制降低籌碼分
+  if (!branchResult && vetoActive) chipsScore = Math.max(chipsScore - 15, 0);
 
   const raw  = Math.min(rsScore + chipsScore + instScore + healthScore + 15, 100);
   const norm = normalizeScore(raw, mode);
@@ -953,6 +1015,10 @@ function calcScore(price, inst) {
     mode, dm, maxPos,
     scores: { rsScore, chipsScore, instScore, healthScore, liquidScore:15 },
     volRatio: vr.toFixed(2),
+    branchEnhanced: !!branchResult,
+    vetoActive,
+    wCR5: branchResult?.wCR5_5d,
+    branchSummary: branchResult,
   };
 
   // ── 存入快取，同一次掃描不重複計算
@@ -1209,11 +1275,11 @@ function cardHTML(d){
         ${tH?`<div style="font-size:11px;color:var(--txt-mut);margin-bottom:5px">近5日投信買賣超（千張）</div><div class="trend-bars">${tH}</div>`:""}
       </div>
       <div class="warn-box">
-        ⚠️ 目前運行於 <b>${s.mode} 模式</b>，籌碼動向以法人月彙總代替分點資料計算。
+        ⚠️ 目前運行於 <b>${s.mode} 模式</b>。
         ${s.dm==="C_SCOUT"?"<br>🔴 <b>C_SCOUT：最多 5% 試單，停損收緊 30%，禁止加碼。</b>":""}
-        ${s.branchEnhanced?`<br>🟣 <b>分點資料已套用，Weighted CR5 = ${s.wCR5}%，評分已升級至 A 模式精度。</b>`:""}
+        ${s.branchEnhanced?`<br>🟣 <b>分點資料已套用（A 模式精度），1日否決：${s.vetoActive?"⛔ 觸發":"✅ 未觸發"}</b>`:""}
       </div>
-      ${branchInputHTML(stockId, loadBranchNotes()[stockId]||null)}
+      ${branchSectionHTML(stockId, p)}
     </div>`;
   }
 
@@ -1251,9 +1317,501 @@ function cardHTML(d){
 function toggleCard(id){expandedId=expandedId===id?null:id;renderResults();}
 
 // ══════════════════════════════════════════════════════
-// 分點資料手動輸入（localStorage 持久化）
+// 分點資料系統 v2.0
+// 四個時間視窗：5日（主）、20日（防線）、1日（否決）、10日（驗證）
+// DTPS 動態權重 + 留倉率回升機制
 // ══════════════════════════════════════════════════════
-const LS_BRANCH = "cbv2_branch_notes"; // { stockId: [{branch,netBuy,dtps},...] }
+const LS_BRANCH = "cbv2_branch_v2"; // { stockId: { "5":{rows,date}, "20":{...}, "1":{...}, "10":{...} } }
+
+// DTPS 動態權重（行為特徵，非名稱黑名單）
+function getDTPS(row) {
+  // row.dtps 是手動輸入或 PDF 解析出來的 DTPS 值
+  return row.dtps ?? 30; // 預設 30（混合型）
+}
+function getQw(dtps, retentionRate5d = null) {
+  // 長期高短沖但近 5 日留倉率 ≥ 70% → 可回升
+  if (dtps > 80 && retentionRate5d !== null && retentionRate5d >= 0.7) return 0.4; // 部分回升
+  if (dtps > 70) return 0.1;   // 高短沖嫌疑
+  if (dtps >= 30) return 0.5;  // 混合型
+  return 1.0;                   // 波段型
+}
+function getDTPSLabel(dtps) {
+  if (dtps > 70) return { label:"隔日沖嫌疑", color: "var(--red)" };
+  if (dtps >= 30) return { label:"混合型",    color: "var(--amber)" };
+  return             { label:"波段型",        color: "var(--green)" };
+}
+
+// localStorage 存取
+function loadBranchDB() {
+  try { return JSON.parse(localStorage.getItem(LS_BRANCH) || "{}"); } catch { return {}; }
+}
+function saveBranchWindow(stockId, windowDays, rows) {
+  const db = loadBranchDB();
+  if (!db[stockId]) db[stockId] = {};
+  db[stockId][String(windowDays)] = { rows, date: todayStr() };
+  try { localStorage.setItem(LS_BRANCH, JSON.stringify(db)); } catch {}
+}
+function getBranchWindow(stockId, windowDays) {
+  const db = loadBranchDB();
+  return db[stockId]?.[String(windowDays)] || null;
+}
+function deleteBranchWindow(stockId, windowDays) {
+  const db = loadBranchDB();
+  if (db[stockId]) { delete db[stockId][String(windowDays)]; localStorage.setItem(LS_BRANCH, JSON.stringify(db)); }
+}
+function hasAnyBranchData(stockId) {
+  const db = loadBranchDB();
+  return db[stockId] && Object.keys(db[stockId]).length > 0;
+}
+
+// ── PDF 解析（pdfjs-dist CDN）
+async function parseBranchPDF(file, stockId, windowDays) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const pdfjsLib = window['pdfjs-dist/build/pdf'];
+        if (!pdfjsLib) { reject(new Error("PDF 解析器尚未載入")); return; }
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+        const pdf   = await pdfjsLib.getDocument({ data: e.target.result }).promise;
+        const rows  = [];
+
+        for (let p = 1; p <= pdf.numPages; p++) {
+          const page    = await pdf.getPage(p);
+          const content = await page.getTextContent();
+          const items   = content.items.map(i => i.str.trim()).filter(Boolean);
+
+          // 解析奇鋐格式：券商名稱 | 買進 | 賣出 | 買賣超 | 均價
+          // 策略：找到數字三連（買、賣、買賣超）前面的文字就是券商名稱
+          for (let i = 0; i < items.length - 3; i++) {
+            const buy  = parseFloat(items[i+1]?.replace(/,/g,""));
+            const sell = parseFloat(items[i+2]?.replace(/,/g,""));
+            const net  = parseFloat(items[i+3]?.replace(/,/g,""));
+            if (!isNaN(buy) && !isNaN(sell) && !isNaN(net) && buy >= 0 && sell >= 0) {
+              const name = items[i];
+              // 過濾掉表頭文字
+              if (name.length < 2 || /^(券商|買進|賣出|買賣超|均價|合計|日期|平均)/.test(name)) continue;
+              // 計算 DTPS 近似值：賣出/買進 比例
+              const dtps = buy > 0 ? Math.min(Math.round((sell / buy) * 100), 100) : 50;
+              rows.push({ branch: name, netBuy: net, buy, sell, dtps });
+              i += 3; // 跳過已解析的數字
+            }
+          }
+        }
+
+        // 去重（同名券商取最大）
+        const merged = {};
+        for (const r of rows) {
+          if (!merged[r.branch] || Math.abs(r.netBuy) > Math.abs(merged[r.branch].netBuy))
+            merged[r.branch] = r;
+        }
+        resolve(Object.values(merged).filter(r => r.netBuy !== 0));
+      } catch(err) { reject(err); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// ── 計算單一視窗的籌碼指標
+function calcWindowMetrics(rows, vol20avg) {
+  if (!rows || !rows.length) return null;
+
+  const netBuyers  = rows.filter(r => r.netBuy > 0);
+  const top5       = [...netBuyers].sort((a,b) => b.netBuy - a.netBuy).slice(0, 5);
+  const totalBuy   = rows.reduce((s,r) => s + (r.buy || Math.max(r.netBuy,0)), 0);
+  const vol        = vol20avg || 10000;
+
+  // Weighted CR5（DTPS 動態權重）
+  const weightedSum = top5.reduce((s,r) => s + r.netBuy * getQw(r.dtps), 0);
+  const wCR5        = Math.min((weightedSum / (vol * 5)) * 100, 100);
+
+  // 留倉率：淨買超 / 總買進
+  const totalNet    = top5.reduce((s,r) => s + r.netBuy, 0);
+  const retention   = totalBuy > 0 ? totalNet / totalBuy : 0;
+
+  // 狼群比例
+  const wolfCount   = top5.filter(r => r.dtps > 70).length;
+  const wolfRatio   = top5.length ? wolfCount / top5.length : 0;
+  const isWolfAttack= wolfRatio >= 0.5;
+
+  return { top5, wCR5, retention, wolfRatio, isWolfAttack, totalBuy, totalNet };
+}
+
+// ── 1日否決邏輯（煞車，不是油門）
+function checkVeto(window1d, window5d) {
+  if (!window1d) return { veto: false };
+  const m1 = calcWindowMetrics(window1d.rows, null);
+  if (!m1) return { veto: false };
+
+  const reasons = [];
+
+  // 條件1：1日狼群比例 ≥ 50%（且 5日是好的）
+  if (m1.isWolfAttack) reasons.push("今日前五大買超分點超過半數為隔日沖嫌疑");
+
+  // 條件2：1日出現核心分點倒貨（若 5日資料有，比對是否反手賣）
+  if (window5d) {
+    const top5Names5d = new Set(calcWindowMetrics(window5d.rows, null)?.top5.map(r => r.branch) || []);
+    const sellingCore = window1d.rows.filter(r => r.netBuy < -50 && top5Names5d.has(r.branch));
+    if (sellingCore.length >= 1)
+      reasons.push(`核心主力分點今日反手賣出（${sellingCore.map(r=>r.branch).join("、")}）`);
+  }
+
+  return {
+    veto: reasons.length > 0,
+    reasons,
+    wolfRatio: m1.wolfRatio,
+  };
+}
+
+// ── 四視窗綜合籌碼評分（升級版 calcScore 使用）
+function calcBranchScore(stockId, vol20avg) {
+  const w5  = getBranchWindow(stockId, 5);
+  const w20 = getBranchWindow(stockId, 20);
+  const w1  = getBranchWindow(stockId, 1);
+  const w10 = getBranchWindow(stockId, 10);
+
+  if (!w5 && !w20) return null; // 沒有主要數據
+
+  const m5  = w5  ? calcWindowMetrics(w5.rows,  vol20avg) : null;
+  const m20 = w20 ? calcWindowMetrics(w20.rows, vol20avg) : null;
+  const veto = checkVeto(w1, w5);
+
+  // 5日主力收集分數（0-25）
+  let score5d = 0;
+  if (m5) {
+    if (m5.isWolfAttack) score5d = 3;
+    else if (m5.wCR5 >= 30 && m5.retention >= 0.7) score5d = 25;
+    else if (m5.wCR5 >= 20) score5d = 18;
+    else if (m5.wCR5 >= 10) score5d = 12;
+    else score5d = 6;
+  }
+
+  // 20日防線分數（0-15）
+  let score20d = 0;
+  if (m20) {
+    if (!m20.isWolfAttack && m20.wCR5 >= 15 && m20.retention >= 0.6) score20d = 15;
+    else if (m20.wCR5 >= 10) score20d = 10;
+    else score20d = 5;
+  }
+
+  // 1日否決：直接扣分
+  const vetoPenalty = veto.veto ? -20 : 0;
+
+  // 10日驗證加分（可選）
+  let score10d = 0;
+  if (w10) {
+    const m10 = calcWindowMetrics(w10.rows, vol20avg);
+    if (m10 && !m10.isWolfAttack && m10.wCR5 >= 15) score10d = 5; // 小幅加分
+  }
+
+  const totalChips = Math.max(score5d + score20d + score10d + vetoPenalty, 0);
+
+  return {
+    mode: "A（分點加強）",
+    score5d, score20d, score10d, vetoPenalty,
+    totalChips,
+    wCR5_5d:  m5  ? m5.wCR5.toFixed(1)  : null,
+    wCR5_20d: m20 ? m20.wCR5.toFixed(1) : null,
+    retention5d:  m5  ? (m5.retention  * 100).toFixed(0) : null,
+    retention20d: m20 ? (m20.retention * 100).toFixed(0) : null,
+    isWolf5d: m5?.isWolfAttack  || false,
+    isWolf20d:m20?.isWolfAttack || false,
+    veto,
+    hasW1: !!w1, hasW5: !!w5, hasW20: !!w20, hasW10: !!w10,
+  };
+}
+
+// ── 分點資料 UI：上傳框 + 解析結果
+function branchSectionHTML(stockId, price) {
+  const db = loadBranchDB();
+  const windows = [
+    { days:5,  label:"5日沉澱",  desc:"核心主力吸籌",     required:true  },
+    { days:20, label:"20日防線", desc:"主力成本與防守",    required:true  },
+    { days:1,  label:"1日否決",  desc:"排除隔日沖干擾",   required:false },
+    { days:10, label:"10日驗證", desc:"確認非短期偶然",   required:false },
+  ];
+
+  const tabsHTML = windows.map(w => {
+    const hasData = !!db[stockId]?.[String(w.days)];
+    const cls = [`branch-tab`, hasData ? "has-data" : ""].join(" ");
+    return `<button class="${cls}" id="btab-${stockId}-${w.days}"
+      onclick="event.stopPropagation();showBranchTab('${stockId}',${w.days})">
+      ${w.label}${w.required ? "" : " <span style='font-size:9px;color:var(--txt-mut)'>(選)</span>"}
+    </button>`;
+  }).join("");
+
+  const panelsHTML = windows.map(w => {
+    const saved = db[stockId]?.[String(w.days)];
+    return `<div id="bpanel-${stockId}-${w.days}" style="display:none">
+      ${branchPanelHTML(stockId, w.days, w.label, w.desc, saved, price?.vol20avg)}
+    </div>`;
+  }).join("");
+
+  // 綜合籌碼摘要
+  const bs = calcBranchScore(stockId, price?.vol20avg);
+  const summaryHTML = bs ? branchSummaryHTML(bs) : "";
+
+  return `<div class="data-section" style="margin-top:10px"
+    onclick="event.stopPropagation()">
+    <div class="sec-title" style="color:var(--purple)">◈ 分點資料分析
+      <span style="font-size:10px;font-weight:400;color:var(--txt-mut)">
+        — 從國泰 APP 匯出 PDF 後上傳
+      </span>
+    </div>
+    ${summaryHTML}
+    <div class="branch-tabs">${tabsHTML}</div>
+    ${panelsHTML}
+  </div>`;
+}
+
+function branchPanelHTML(stockId, days, label, desc, saved, vol20avg) {
+  const metrics = saved ? calcWindowMetrics(saved.rows, vol20avg) : null;
+  const rowsHTML = metrics ? metrics.top5.map(r => {
+    const { label: dtpsLabel, color } = getDTPSLabel(r.dtps);
+    const qw = getQw(r.dtps);
+    return `<div class="branch-row">
+      <span class="branch-name">${r.branch}</span>
+      <span class="branch-buy" style="color:${r.netBuy>0?'var(--green)':'var(--red)'}">
+        ${r.netBuy>0?"+":""}${r.netBuy.toLocaleString()}張
+      </span>
+      <span class="branch-dtps-badge" style="color:${color};border-color:${color}33;background:${color}11">
+        ${dtpsLabel}
+      </span>
+      <span class="branch-qw">Qw ${qw}</span>
+    </div>`;
+  }).join("") : "";
+
+  const metricsHTML = metrics ? `
+    <div class="branch-summary" style="margin-top:8px">
+      <div class="branch-summary-row">
+        <span style="color:var(--txt-sec)">Weighted CR5</span>
+        <span style="font-weight:800;color:${metrics.wCR5>=20?'var(--green)':'var(--amber)'}">
+          ${metrics.wCR5.toFixed(1)}%
+        </span>
+      </div>
+      <div class="branch-summary-row">
+        <span style="color:var(--txt-sec)">留倉率</span>
+        <span style="font-weight:800;color:${metrics.retention>=0.7?'var(--green)':'var(--amber)'}">
+          ${(metrics.retention*100).toFixed(0)}%
+        </span>
+      </div>
+      <div class="branch-summary-row">
+        <span style="color:var(--txt-sec)">狼群比例</span>
+        <span style="font-weight:800;color:${metrics.wolfRatio>=0.5?'var(--red)':'var(--green)'}">
+          ${(metrics.wolfRatio*100).toFixed(0)}%
+          ${metrics.isWolfAttack?"⚠️ 假抗跌警告":""}
+        </span>
+      </div>
+      <div class="branch-summary-row">
+        <span style="color:var(--txt-sec)">資料日期</span>
+        <span style="color:var(--txt-mut)">${saved.date.slice(0,4)}/${saved.date.slice(4,6)}/${saved.date.slice(6,8)}</span>
+      </div>
+    </div>` : "";
+
+  return `<div style="padding-top:8px">
+    <div style="font-size:11px;color:var(--txt-mut);margin-bottom:8px">
+      <b>${label}</b> — ${desc}
+    </div>
+    ${rowsHTML ? `<div>${rowsHTML}</div>${metricsHTML}` : ""}
+    <div class="branch-upload-zone" id="bzone-${stockId}-${days}"
+      ondragover="event.preventDefault();event.stopPropagation();this.classList.add('drag-over')"
+      ondragleave="this.classList.remove('drag-over')"
+      ondrop="event.preventDefault();event.stopPropagation();this.classList.remove('drag-over');handleBranchDrop(event,'${stockId}',${days})"
+      onclick="event.stopPropagation();document.getElementById('bfile-${stockId}-${days}').click()">
+      <div class="branch-upload-icon">📄</div>
+      <div class="branch-upload-text">${saved?"重新上傳 PDF 更新資料":"點擊或拖曳 PDF 至此"}</div>
+      <div class="branch-upload-hint">從國泰 APP 匯出「近${days}日分點」PDF</div>
+    </div>
+    <input type="file" id="bfile-${stockId}-${days}" accept=".pdf"
+      style="display:none"
+      onchange="handleBranchFile(event,'${stockId}',${days})"
+      onclick="event.stopPropagation()"/>
+    ${saved ? `<button onclick="event.stopPropagation();clearBranchWindow('${stockId}',${days})"
+      style="margin-top:6px;padding:4px 12px;border-radius:6px;border:1px solid var(--border);
+        background:var(--bg-section);color:var(--txt-mut);cursor:pointer;font-size:11px;font-family:inherit">
+      ✕ 清除${label}資料
+    </button>` : ""}
+  </div>`;
+}
+
+function branchSummaryHTML(bs) {
+  if (!bs.hasW5 && !bs.hasW20) return "";
+  const vetoStyle = bs.veto?.veto
+    ? "background:rgba(220,38,38,0.08);border:1px solid rgba(220,38,38,0.3);"
+    : "background:rgba(5,156,85,0.08);border:1px solid rgba(5,156,85,0.3);";
+
+  return `<div style="margin-bottom:10px;padding:10px 12px;border-radius:8px;${vetoStyle}">
+    <div style="font-size:11px;font-weight:700;color:${bs.veto?.veto?'var(--red)':'var(--green)'};margin-bottom:6px">
+      ${bs.veto?.veto?"🔴 1日否決觸發 — 取消進場資格":"✅ 分點資料已套用 — A模式精度"}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+      ${bs.hasW5 ? `<div style="font-size:11px;color:var(--txt-sec)">
+        5日 CR5: <b style="color:var(--green)">${bs.wCR5_5d}%</b>
+        &nbsp;留倉: <b>${bs.retention5d}%</b>
+        ${bs.isWolf5d?"⚠️":""}
+      </div>` : ""}
+      ${bs.hasW20 ? `<div style="font-size:11px;color:var(--txt-sec)">
+        20日 CR5: <b style="color:var(--blue)">${bs.wCR5_20d}%</b>
+        &nbsp;留倉: <b>${bs.retention20d}%</b>
+      </div>` : ""}
+    </div>
+    ${bs.veto?.veto ? `<div style="font-size:11px;color:var(--red);margin-top:4px">
+      原因：${bs.veto.reasons.join("；")}
+    </div>` : ""}
+  </div>`;
+}
+
+// ── 標籤頁切換
+function showBranchTab(stockId, days) {
+  [5,20,1,10].forEach(d => {
+    const tab   = document.getElementById(`btab-${stockId}-${d}`);
+    const panel = document.getElementById(`bpanel-${stockId}-${d}`);
+    if (tab)   tab.classList.toggle("active", d === days);
+    if (panel) panel.style.display = d === days ? "block" : "none";
+  });
+}
+
+// ── PDF 上傳處理
+async function handleBranchFile(event, stockId, days) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  await processBranchPDF(file, stockId, days);
+}
+async function handleBranchDrop(event, stockId, days) {
+  const file = event.dataTransfer?.files?.[0];
+  if (!file || !file.name.endsWith(".pdf")) { alert("請上傳 PDF 檔案"); return; }
+  await processBranchPDF(file, stockId, days);
+}
+
+async function processBranchPDF(file, stockId, days) {
+  const zone = document.getElementById(`bzone-${stockId}-${days}`);
+  if (zone) { zone.innerHTML = `<div class="branch-upload-text">⏳ 解析中…</div>`; }
+
+  try {
+    const rows = await parseBranchPDF(file, stockId, days);
+    if (!rows.length) throw new Error("未能解析出分點資料，請確認 PDF 格式");
+    saveBranchWindow(stockId, days, rows);
+
+    // 清除評分快取，重新計算
+    delete _scoreCache[stockId];
+    const d = stockData.find(x => x.stockId === stockId);
+    if (d) {
+      const bs = calcBranchScore(stockId, d.price?.vol20avg);
+      if (bs) d.branchScore = bs;
+      d.score = calcScoreFull(d.price, d.inst, bs);
+      renderResults();
+    }
+    // 重新渲染卡片（展開狀態不變）
+    expandedId = stockId;
+    renderResults();
+  } catch(err) {
+    alert(`PDF 解析失敗：${err.message}`);
+    if (zone) { zone.innerHTML = `<div class="branch-upload-text">❌ 解析失敗，請重試</div>`; }
+  }
+}
+
+function clearBranchWindow(stockId, days) {
+  if (!confirm(`確定清除 ${stockId} 的近${days}日分點資料？`)) return;
+  deleteBranchWindow(stockId, days);
+  delete _scoreCache[stockId];
+  const d = stockData.find(x => x.stockId === stockId);
+  if (d) {
+    const bs = calcBranchScore(stockId, d.price?.vol20avg);
+    d.branchScore = bs;
+    d.score = calcScoreFull(d.price, d.inst, bs);
+    renderResults();
+  }
+}
+
+// ── 整合分點的完整評分（取代舊 calcScore）
+function calcScoreFull(price, inst, branchScore) {
+  if (!price) return null;
+  const cacheKey = price.stockId + (branchScore ? "_branch" : "");
+  if (_scoreCache[cacheKey]) return _scoreCache[cacheKey];
+
+  const mode  = branchScore ? "A" : detectMode(inst);
+  const rs    = price.changePct || 0;
+  const above = price.above20ma || false;
+  const vr    = (price.vol5avg && price.vol20avg) ? price.vol5avg / price.vol20avg : 1;
+  const { sitDays=0, foreignDays=0, sitBuy=false } = inst || {};
+
+  const rsScore     = rs>=3&&above?25: rs>=1?18: rs>=0?10:0;
+  const instScore   = sitDays>=3?15: foreignDays>=3&&!sitBuy?8:
+                      sitDays*1.5+foreignDays*0.5>=3?10: sitDays*1.5+foreignDays*0.5>=1?5:0;
+  const healthScore = vr<=0.7?20: vr<=0.85?12:6;
+
+  // 籌碼分數：有分點資料用 branchScore，否則用法人估算
+  const chipsScore = branchScore
+    ? Math.min(branchScore.score5d + branchScore.score20d + branchScore.score10d, 25)
+    : (mode==="C" ? 0 : mode==="A" ? (sitDays>=3?22:sitDays>=2?18:foreignDays>=3?14:8) : (sitDays>=1?10:foreignDays>=1?6:3));
+
+  // 1日否決：直接歸零籌碼分
+  const effectiveChips = (branchScore?.veto?.veto) ? 0 : chipsScore;
+
+  const raw  = Math.min(rsScore + effectiveChips + instScore + healthScore + 15, 100);
+  const norm = normalizeScore(raw, mode);
+  const thr  = MODE_CONFIG[mode]?.threshold ?? 85;
+  const isWarmMarket = regime?.regime === "溫床市場";
+
+  let dm, maxPos;
+  if (mode === "A") {
+    if (branchScore?.veto?.veto) { dm = "C_OBSERVE"; maxPos = POSITION_CAP.C_OBSERVE; }
+    else if (norm >= thr) { dm = "A_HUNT"; maxPos = POSITION_CAP.A_HUNT; }
+    else { dm = "B_TRACK"; maxPos = POSITION_CAP.B_TRACK; }
+  } else if (mode === "B_PLUS") {
+    dm = norm >= thr ? "B_TRACK" : "C_OBSERVE";
+    maxPos = dm === "B_TRACK" ? POSITION_CAP.B_TRACK : POSITION_CAP.C_OBSERVE;
+  } else if (mode === "B") {
+    dm = norm >= thr ? "B_PROXY_TRACK" : "C_OBSERVE";
+    maxPos = dm === "B_PROXY_TRACK" ? POSITION_CAP.B_PROXY_TRACK : POSITION_CAP.C_OBSERVE;
+  } else {
+    if (isWarmMarket && norm >= 85 && above) { dm = "C_SCOUT"; maxPos = POSITION_CAP.C_SCOUT; }
+    else { dm = "C_OBSERVE"; maxPos = POSITION_CAP.C_OBSERVE; }
+  }
+
+  const signal = norm >= thr && dm !== "C_OBSERVE";
+  let label, color, msg;
+
+  if (branchScore?.veto?.veto) {
+    label="1日否決"; color="var(--red)";
+    msg="近1日分點資料觸發否決條件：" + (branchScore.veto.reasons?.[0] || "隔日沖干擾") + "。即使中長線籌碼健康，今日不宜進場。明日重新評估。";
+  } else if (!signal || dm==="C_OBSERVE") {
+    label="冷眼旁觀"; color="var(--txt-mut)";
+    msg="結構條件未達標準或資料解析度不足。此時進場為盲目行動。";
+  } else if (norm >= 85) {
+    label = branchScore ? "分點確認 — 等待Trigger" : "等待Trigger";
+    color = "var(--green)";
+    msg = branchScore
+      ? `分點資料確認主力積極吸籌（5日CR5 ${branchScore.wCR5_5d}%），籌碼集中度達標。深海章魚已完成收集，等待觸發。`
+      : "深海章魚正在低調完成最後收集，浮額大量消失。請保持獵人耐心，等待觸發。";
+  } else if (norm >= 75) {
+    label="籌碼沉澱中"; color="var(--blue)";
+    msg = branchScore
+      ? `分點顯示主力持續建倉（5日留倉率${branchScore.retention5d}%），浮額消失中。保持耐心。`
+      : (sitDays>=2?"深海章魚正在低調收集，市場尚未察覺。請保持獵人耐心。":"主力足跡清晰，等待量縮完成後的突破訊號。");
+  } else {
+    label="疑似吸籌"; color="var(--amber)";
+    msg="有潛在主力跡象，但結構尚未成熟。列入觀察名單持續追蹤。";
+  }
+
+  const result = {
+    total: Math.round(norm), raw, label, color, msg, mode, dm, maxPos,
+    scores: { rsScore, chipsScore: effectiveChips, instScore, healthScore, liquidScore:15 },
+    volRatio: vr.toFixed(2),
+    branchEnhanced: !!branchScore,
+    branchScore,
+  };
+  _scoreCache[cacheKey] = result;
+  return result;
+}
+
+// 相容舊版 calcScore 介面
+function calcScore(price, inst) {
+  const bs = hasAnyBranchData(price?.stockId) ? calcBranchScore(price?.stockId, price?.vol20avg) : null;
+  return calcScoreFull(price, inst, bs);
+}
 
 function loadBranchNotes() {
   try { return JSON.parse(localStorage.getItem(LS_BRANCH) || "{}"); } catch { return {}; }
